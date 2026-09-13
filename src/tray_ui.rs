@@ -64,6 +64,8 @@ impl TrayMenu {
             .build()
             .expect("failed to create tray icon");
 
+        crate::debug_log::log(format!("tray icon rect: {:?}", tray.rect()));
+
         Self {
             _tray: tray,
             toggle_item,
@@ -86,6 +88,7 @@ impl TrayMenu {
         let mut action = None;
 
         while let Ok(event) = TrayIconEvent::receiver().try_recv() {
+            crate::debug_log::log(format!("tray event: {event:?}"));
             if let TrayIconEvent::DoubleClick {
                 button: MouseButton::Left,
                 ..
@@ -96,6 +99,7 @@ impl TrayMenu {
         }
 
         while let Ok(event) = MenuEvent::receiver().try_recv() {
+            crate::debug_log::log(format!("menu event: id={:?}", event.id));
             if event.id == *self.toggle_item.id() {
                 action = Some(TrayAction::ToggleOverlay);
             } else if event.id == *self.autostart_item.id() {

@@ -213,10 +213,6 @@ fn main() -> eframe::Result<()> {
     let shared = Arc::new(Mutex::new(SharedState::default()));
     spawn_hid_poller(shared.clone());
 
-    // Must be created on this (main) thread: on Windows it relies on the same
-    // Win32 message loop that winit/eframe pumps below to receive its events.
-    let tray_menu = tray_ui::TrayMenu::build(false, autostart::is_enabled());
-
     let screen_w = unsafe { GetSystemMetrics(SM_CXSCREEN) };
     let win_w = 220.0;
     let margin = 16.0;
@@ -241,8 +237,14 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "HyperX Overlay",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             egui_extras::install_image_loaders(&cc.egui_ctx);
+            // Built here (inside the eframe/winit event loop setup), not earlier
+            // in `main`: on Windows the tray/menu event pump must run on the
+            // same thread as the actual winit event loop, and creating it too
+            // early risked landing on the wrong one — matching tray-icon's own
+            // documented eframe integration example.
+            let tray_menu = tray_ui::TrayMenu::build(false, autostart::is_enabled());
             Ok(Box::new(OverlayApp {
                 shared,
                 tray_menu,
