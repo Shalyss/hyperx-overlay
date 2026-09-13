@@ -116,3 +116,14 @@ fn toggle_label(hidden: bool) -> &'static str {
         "Masquer l'overlay"
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn label_reflects_hidden_state() {
+        assert_eq!(toggle_label(true), "Afficher l'overlay");
+        assert_eq!(toggle_label(false), "Masquer l'overlay");
+    }
+}

@@ -46,10 +46,35 @@ fn spawn_hid_poller(shared: Arc<Mutex<SharedState>>) {
     });
 }
 
+/// Parked position while "hidden". We deliberately do NOT use
+/// `ViewportCommand::Visible(false)` to hide the overlay: on Windows, an
+/// invisible window stops receiving `WM_PAINT`, and eframe's repaint loop is
+/// driven by that — so the app would never wake up again to notice a tray
+/// click asking to bring it back. Moving the window off-screen instead keeps
+/// it "visible" as far as Windows is concerned (repaints keep flowing), while
+/// being just as invisible to the user.
+const OFFSCREEN_POS: egui::Pos2 = egui::pos2(-32000.0, -32000.0);
+
 struct OverlayApp {
     shared: Arc<Mutex<SharedState>>,
     tray_menu: tray_ui::TrayMenu,
     hidden: bool,
+    shown_pos: egui::Pos2,
+}
+
+impl OverlayApp {
+    fn set_hidden(&mut self, ctx: &egui::Context, hidden: bool) {
+        if hidden == self.hidden {
+            return;
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(if hidden {
+            OFFSCREEN_POS
+        } else {
+            self.shown_pos
+        }));
+        self.hidden = hidden;
+        self.tray_menu.set_hidden_label(hidden);
+    }
 }
 
 impl eframe::App for OverlayApp {
@@ -62,11 +87,18 @@ impl eframe::App for OverlayApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
+        // Remember the last on-screen position (e.g. after a drag) so
+        // "Afficher" restores it there instead of the original spawn spot.
+        if !self.hidden {
+            if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
+                self.shown_pos = rect.min;
+            }
+        }
+
         match self.tray_menu.poll() {
             Some(tray_ui::TrayAction::ToggleOverlay) => {
-                self.hidden = !self.hidden;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(!self.hidden));
-                self.tray_menu.set_hidden_label(self.hidden);
+                let now_hidden = !self.hidden;
+                self.set_hidden(ctx, now_hidden);
             }
             Some(tray_ui::TrayAction::ToggleAutostart) => {
                 let enabled = !autostart::is_enabled();
@@ -84,17 +116,15 @@ impl eframe::App for OverlayApp {
             i.modifiers.alt && i.pointer.button_clicked(egui::PointerButton::Primary)
         });
         if alt_click && !self.hidden {
-            self.hidden = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            self.tray_menu.set_hidden_label(true);
+            self.set_hidden(ctx, true);
         }
 
-        // Keep polling (tray events, capslock) even while hidden and nothing is drawn.
+        // Keep drawing (off-screen while hidden) rather than skip the frame:
+        // this keeps eframe's normal repaint/viewport-info flow, which is
+        // exactly what OFFSCREEN_POS relies on. See its doc comment.
         if self.hidden {
-            ctx.request_repaint_after(Duration::from_millis(200));
-            return;
+            debug_log::log("tick (hidden, off-screen)");
         }
-
         let caps = caps_lock_on();
         let (mouse, headset) = match self.shared.lock() {
             Ok(s) => (s.mouse, s.headset),
@@ -217,6 +247,7 @@ fn main() -> eframe::Result<()> {
                 shared,
                 tray_menu,
                 hidden: false,
+                shown_pos: egui::pos2(pos_x, margin),
             }))
         }),
     )

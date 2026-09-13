@@ -93,13 +93,46 @@ fn request_matching(
     None
 }
 
-/// Pulsefire Saga Pro battery/power status.
+/// Parse a Pulsefire Saga Pro status response: `51 02 PP SS TT 00 VV VV`.
+/// PP = battery percent, SS = power state (0=on battery, 1=charging, 2=full).
+/// Pure function (no I/O) so it can be unit-tested against captured bytes
+/// without needing the mouse plugged in.
+fn parse_mouse_response(resp: &[u8]) -> Option<DeviceStatus> {
+    if resp.len() < 4 || resp[0] != 0x51 || resp[1] != 0x02 {
+        return None;
+    }
+    let pct = resp[2];
+    let state = resp[3];
+    Some(DeviceStatus {
+        connected: true,
+        battery_pct: (pct <= 100).then_some(pct),
+        charging: state == 0x01 || state == 0x02,
+    })
+}
+
+/// Parse a Cloud III S Wireless status response: battery percent at byte 6.
 ///
-/// Request `50 02` (padded to 64 bytes), response `51 02 PP SS TT 00 VV VV`:
-/// PP = battery percent, SS = power state (0=on battery, 1=charging, 2=full),
-/// TT = temperature, VV VV = voltage in mV (little-endian). Multiple HID
-/// collections exist on the dongle (movement, lighting/LampArray, status); we
-/// probe each non-lighting one since the exact collection can vary by firmware.
+/// No charging bit is known for this model — the reference implementation
+/// this protocol was reverse-engineered from
+/// (auto94/HyperX-Cloud-2-Battery-Monitor) has no charging detection for
+/// Cloud III S either, only for the plain (non-S) Cloud III. So `charging`
+/// is always reported `false` here until someone captures the real byte via
+/// `HYPERX_OVERLAY_DEBUG=1` while charging and we can add it.
+fn parse_headset_response(resp: &[u8]) -> Option<DeviceStatus> {
+    if resp.len() <= 6 {
+        return None;
+    }
+    let pct = resp[6];
+    Some(DeviceStatus {
+        connected: true,
+        battery_pct: (pct <= 100).then_some(pct),
+        charging: false,
+    })
+}
+
+/// Pulsefire Saga Pro battery/power status. Multiple HID collections exist on
+/// the dongle (movement, lighting/LampArray, status); we probe each
+/// non-lighting one since the exact collection can vary by firmware.
 pub fn poll_mouse(api: &HidApi) -> DeviceStatus {
     let request = pad64(&[0x50, 0x02]);
     for info in api.device_list() {
@@ -112,23 +145,17 @@ pub fn poll_mouse(api: &HidApi) -> DeviceStatus {
             continue;
         };
         if let Some(resp) = request_matching(&dev, &request, &[0x51, 0x02], "mouse") {
-            let pct = resp[2];
-            let state = resp[3];
-            debug_log::log(format!("mouse: parsed pct={pct} state={state}"));
-            return DeviceStatus {
-                connected: true,
-                battery_pct: (pct <= 100).then_some(pct),
-                charging: state == 0x01 || state == 0x02,
-            };
+            if let Some(status) = parse_mouse_response(&resp) {
+                debug_log::log(format!("mouse: parsed {status:?}"));
+                return status;
+            }
         }
     }
     DeviceStatus::default()
 }
 
-/// Cloud III S Wireless battery status.
-///
-/// Request `0c 02 03 01 00 06` on the vendor collection (usage page 448,
-/// usage 1); battery percent lands at byte 6 of the response.
+/// Cloud III S Wireless battery status: request `0c 02 03 01 00 06` on the
+/// vendor collection (usage page 448, usage 1).
 pub fn poll_headset(api: &HidApi) -> DeviceStatus {
     let request = [0x0c, 0x02, 0x03, 0x01, 0x00, 0x06];
     for info in api.device_list() {
@@ -160,16 +187,79 @@ pub fn poll_headset(api: &HidApi) -> DeviceStatus {
             if n > 0 {
                 debug_log::log_bytes("headset <<", &resp[..n]);
             }
-            if n > 6 {
-                let pct = resp[6];
-                debug_log::log(format!("headset: parsed pct={pct}"));
-                return DeviceStatus {
-                    connected: true,
-                    battery_pct: (pct <= 100).then_some(pct),
-                    charging: false,
-                };
+            if let Some(status) = parse_headset_response(&resp[..n]) {
+                debug_log::log(format!("headset: parsed {status:?}"));
+                return status;
             }
         }
     }
     DeviceStatus::default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mouse_on_battery() {
+        let resp = [0x51, 0x02, 73, 0x00, 25, 0x00, 0x10, 0x0f];
+        let status = parse_mouse_response(&resp).unwrap();
+        assert!(status.connected);
+        assert_eq!(status.battery_pct, Some(73));
+        assert!(!status.charging);
+    }
+
+    #[test]
+    fn mouse_charging() {
+        let resp = [0x51, 0x02, 40, 0x01, 25, 0x00, 0x10, 0x0f];
+        let status = parse_mouse_response(&resp).unwrap();
+        assert_eq!(status.battery_pct, Some(40));
+        assert!(status.charging, "state byte 0x01 must be reported as charging");
+    }
+
+    #[test]
+    fn mouse_full_charge_counts_as_charging() {
+        let resp = [0x51, 0x02, 100, 0x02, 25, 0x00, 0x00, 0x00];
+        let status = parse_mouse_response(&resp).unwrap();
+        assert!(status.charging, "state byte 0x02 (full/on USB power) must be reported as charging");
+    }
+
+    #[test]
+    fn mouse_wrong_prefix_is_rejected() {
+        // some other HID collection answering with an unrelated report
+        let resp = [0x01, 0x02, 3, 4, 5, 6, 7, 8];
+        assert!(parse_mouse_response(&resp).is_none());
+    }
+
+    #[test]
+    fn mouse_too_short_is_rejected() {
+        let resp = [0x51, 0x02, 50];
+        assert!(parse_mouse_response(&resp).is_none());
+    }
+
+    #[test]
+    fn mouse_invalid_percent_is_none_but_still_connected() {
+        let resp = [0x51, 0x02, 0xff, 0x00, 0, 0, 0, 0];
+        let status = parse_mouse_response(&resp).unwrap();
+        assert!(status.connected);
+        assert_eq!(status.battery_pct, None);
+    }
+
+    #[test]
+    fn headset_battery_at_byte_6() {
+        let mut resp = [0u8; 12];
+        resp[6] = 62;
+        let status = parse_headset_response(&resp).unwrap();
+        assert_eq!(status.battery_pct, Some(62));
+        assert!(
+            !status.charging,
+            "no charging bit is known for Cloud III S yet — must stay false, not guessed"
+        );
+    }
+
+    #[test]
+    fn headset_too_short_is_rejected() {
+        let resp = [0u8; 6]; // exactly 6 bytes: no index 6 exists
+        assert!(parse_headset_response(&resp).is_none());
+    }
 }
