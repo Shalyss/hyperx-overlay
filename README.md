@@ -19,7 +19,13 @@ Petit overlay Windows (toujours au premier plan, sans bordure) qui affiche :
   au lieu de planter.
 
 - Fenêtre déplaçable : cliquer-glisser n'importe où dessus pour la repositionner.
-- `Échap` (fenêtre active) ferme l'overlay.
+- `Alt + Clic` sur l'overlay : le masque (il reste accessible depuis le tray).
+- Icône dans la zone de notification (tray), toujours présente :
+  - **Double-clic** : affiche/masque l'overlay.
+  - **Clic droit** : menu avec *Afficher/Masquer l'overlay*, *Lancer au
+    démarrage* (ajoute/retire l'app de `HKCU\...\Run`, sans droits admin) et
+    *Quitter*.
+- `Échap` (fenêtre active) ferme complètement l'overlay.
 
 ## Build
 

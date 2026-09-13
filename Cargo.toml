@@ -5,8 +5,12 @@ edition = "2024"
 
 [dependencies]
 eframe = "0.31"
+egui_extras = { version = "0.31", features = ["svg"] }
 hidapi = { version = "2", default-features = false, features = ["windows-native"] }
+resvg = { version = "0.37", default-features = false }
+tray-icon = "0.25.0"
 windows = { version = "0.58", features = ["Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }
+winreg = "0.56.0"
 
 [profile.release]
 opt-level = "s"
