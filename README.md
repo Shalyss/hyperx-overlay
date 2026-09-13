@@ -41,5 +41,28 @@ Un tag `vX.Y.Z` crée en plus une Release GitHub avec l'exe attaché.
 
 Protocole non officiel : HyperX/HP peut le changer à tout moment via une mise
 à jour firmware/NGENUITY, ce qui casserait la lecture de batterie (le Verr.
-Maj continuerait de fonctionner). Testé/écrit sans matériel HyperX branché au
-moment du développement initial — à valider une fois les dongles connectés.
+Maj continuerait de fonctionner). Écrit et compilé sans matériel HyperX
+disponible pour tester — à valider sur une vraie Pulsefire Saga Pro / Cloud
+III S.
+
+## Si la batterie n'affiche rien (`--`)
+
+Lancer l'overlay avec la variable d'environnement `HYPERX_OVERLAY_DEBUG=1`
+depuis un terminal (pas en double-cliquant) pour activer un journal détaillé :
+
+```powershell
+$env:HYPERX_OVERLAY_DEBUG = "1"
+.\hyperx-overlay.exe
+```
+
+Laisser tourner ~1 minute (une interrogation a lieu au démarrage puis toutes
+les 30s), fermer avec `Échap`, puis envoyer le fichier généré :
+
+```
+%TEMP%\hyperx-overlay-debug.log
+```
+
+Ce fichier liste tous les périphériques HID HyperX/Kingston détectés (VID,
+PID, usage page, nom) ainsi que chaque requête/réponse brute échangée avec la
+souris et le casque — de quoi corriger précisément les identifiants ou le
+format de trame sans avoir le matériel sous la main.

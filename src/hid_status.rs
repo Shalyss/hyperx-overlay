@@ -1,10 +1,13 @@
 //! Vendor HID protocol for reading battery status off HyperX wireless dongles.
 //!
-//! Reverse-engineered by the community (not documented by HyperX/HP):
+//! Reverse-engineered by the community (not documented by HyperX/HP), and not
+//! validated here against real hardware — see `debug_log` for how to collect
+//! diagnostics from a machine that actually has the devices:
 //! - Pulsefire Saga Pro: <https://github.com/notwaterbtl/hyperx-saga-control>
 //! - Cloud III S Wireless: <https://github.com/auto94/HyperX-Cloud-2-Battery-Monitor>
 
-use hidapi::{HidApi, HidDevice};
+use crate::debug_log;
+use hidapi::{DeviceInfo, HidApi, HidDevice};
 use std::time::{Duration, Instant};
 
 pub const VID_HP: u16 = 0x03F0;
@@ -33,20 +36,55 @@ fn pad64(data: &[u8]) -> [u8; 64] {
     buf
 }
 
+fn product_matches(info: &DeviceInfo, needle: &str) -> bool {
+    info.product_string()
+        .is_some_and(|s| s.to_lowercase().contains(needle))
+}
+
 fn drain(dev: &HidDevice) {
     let mut scratch = [0u8; 64];
     while matches!(dev.read_timeout(&mut scratch, 0), Ok(n) if n > 0) {}
 }
 
+/// Log every HP/Kingston HID collection currently enumerated, so that if the
+/// known PIDs above are wrong for someone's specific unit/region, we can see
+/// the real vendor/product IDs and usage pages in their debug log.
+pub fn log_known_devices(api: &HidApi) {
+    debug_log::log("---- HID device enumeration (VID 0x03F0 / 0x0951) ----");
+    for info in api.device_list() {
+        if info.vendor_id() != VID_HP && info.vendor_id() != 0x0951 {
+            continue;
+        }
+        debug_log::log(format!(
+            "vid={:#06x} pid={:#06x} usage_page={} usage={} product={:?} path={:?}",
+            info.vendor_id(),
+            info.product_id(),
+            info.usage_page(),
+            info.usage(),
+            info.product_string(),
+            info.path()
+        ));
+    }
+}
+
 /// Send `request` and wait up to ~350ms for a response starting with `match_prefix`.
-fn request_matching(dev: &HidDevice, request: &[u8], match_prefix: &[u8]) -> Option<[u8; 64]> {
+fn request_matching(
+    dev: &HidDevice,
+    request: &[u8],
+    match_prefix: &[u8],
+    log_label: &str,
+) -> Option<[u8; 64]> {
     drain(dev);
+    debug_log::log_bytes(&format!("{log_label} >>"), request);
     dev.write(request).ok()?;
 
     let deadline = Instant::now() + Duration::from_millis(350);
     let mut resp = [0u8; 64];
     while Instant::now() < deadline {
         if let Ok(n) = dev.read_timeout(&mut resp, 100) {
+            if n > 0 {
+                debug_log::log_bytes(&format!("{log_label} <<"), &resp[..n]);
+            }
             if n >= match_prefix.len() && resp[..match_prefix.len()] == *match_prefix {
                 return Some(resp);
             }
@@ -65,18 +103,18 @@ fn request_matching(dev: &HidDevice, request: &[u8], match_prefix: &[u8]) -> Opt
 pub fn poll_mouse(api: &HidApi) -> DeviceStatus {
     let request = pad64(&[0x50, 0x02]);
     for info in api.device_list() {
-        if info.vendor_id() != VID_HP
-            || !MOUSE_PIDS.contains(&info.product_id())
-            || info.usage_page() == LAMP_ARRAY_USAGE_PAGE
-        {
+        let matches_id = info.vendor_id() == VID_HP && MOUSE_PIDS.contains(&info.product_id());
+        let matches_name = info.vendor_id() == VID_HP && product_matches(info, "saga pro");
+        if (!matches_id && !matches_name) || info.usage_page() == LAMP_ARRAY_USAGE_PAGE {
             continue;
         }
         let Ok(dev) = info.open_device(api) else {
             continue;
         };
-        if let Some(resp) = request_matching(&dev, &request, &[0x51, 0x02]) {
+        if let Some(resp) = request_matching(&dev, &request, &[0x51, 0x02], "mouse") {
             let pct = resp[2];
             let state = resp[3];
+            debug_log::log(format!("mouse: parsed pct={pct} state={state}"));
             return DeviceStatus {
                 connected: true,
                 battery_pct: (pct <= 100).then_some(pct),
@@ -94,24 +132,37 @@ pub fn poll_mouse(api: &HidApi) -> DeviceStatus {
 pub fn poll_headset(api: &HidApi) -> DeviceStatus {
     let request = [0x0c, 0x02, 0x03, 0x01, 0x00, 0x06];
     for info in api.device_list() {
-        if info.vendor_id() != VID_HP
-            || info.product_id() != HEADSET_PID
-            || info.usage_page() != HEADSET_USAGE_PAGE
-            || info.usage() != HEADSET_USAGE
-        {
+        let matches_id = info.vendor_id() == VID_HP && info.product_id() == HEADSET_PID;
+        let matches_name = info.vendor_id() == VID_HP && product_matches(info, "cloud iii s");
+        if !matches_id && !matches_name {
+            continue;
+        }
+        if info.usage_page() != HEADSET_USAGE_PAGE || info.usage() != HEADSET_USAGE {
+            debug_log::log(format!(
+                "headset: skipping non-matching collection usage_page={} usage={} (want {}/{})",
+                info.usage_page(),
+                info.usage(),
+                HEADSET_USAGE_PAGE,
+                HEADSET_USAGE
+            ));
             continue;
         }
         let Ok(dev) = info.open_device(api) else {
             continue;
         };
         drain(&dev);
+        debug_log::log_bytes("headset >>", &request);
         if dev.write(&request).is_err() {
             continue;
         }
         let mut resp = [0u8; 64];
         if let Ok(n) = dev.read_timeout(&mut resp, 1000) {
+            if n > 0 {
+                debug_log::log_bytes("headset <<", &resp[..n]);
+            }
             if n > 6 {
                 let pct = resp[6];
+                debug_log::log(format!("headset: parsed pct={pct}"));
                 return DeviceStatus {
                     connected: true,
                     battery_pct: (pct <= 100).then_some(pct),

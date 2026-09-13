@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 
+mod debug_log;
 mod hid_status;
 
 use eframe::egui;
@@ -31,6 +32,7 @@ fn spawn_hid_poller(shared: Arc<Mutex<SharedState>>) {
         };
         loop {
             let _ = api.refresh_devices();
+            hid_status::log_known_devices(&api);
             let mouse = hid_status::poll_mouse(&api);
             let headset = hid_status::poll_headset(&api);
             if let Ok(mut s) = shared.lock() {
