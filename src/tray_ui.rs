@@ -1,10 +1,16 @@
-//! Persistent system tray icon: right-click for a menu (toggle overlay,
-//! autostart, quit), double-click to toggle the overlay directly.
+//! Native Windows system tray running on its own message-loop thread.
+//!
+//! `eframe` owns its winit event loop and does not expose the event-loop proxy
+//! required by `tray-icon`. Keeping the tray's hidden window and its Win32
+//! message dispatch here makes menu commands reliable even while the overlay
+//! is unfocused or parked off-screen.
 
 use resvg::tiny_skia;
 use resvg::usvg::{self, TreeParsing};
+use std::sync::mpsc::{self, Receiver};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-use tray_icon::{Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent};
+use tray_icon::{Icon, MouseButton, TrayIconBuilder, TrayIconEvent};
+use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, GetMessageW, TranslateMessage, MSG};
 
 const TRAY_SVG: &[u8] = include_bytes!("assets/tray.svg");
 
@@ -39,95 +45,84 @@ pub enum TrayAction {
 }
 
 pub struct TrayMenu {
-    _tray: TrayIcon,
-    toggle_item: MenuItem,
-    autostart_item: CheckMenuItem,
-    quit_item: MenuItem,
+    actions: Receiver<TrayAction>,
 }
 
 impl TrayMenu {
-    pub fn build(hidden: bool, autostart_enabled: bool) -> Self {
-        let toggle_item = MenuItem::new(toggle_label(hidden), true, None);
-        let autostart_item = CheckMenuItem::new("Lancer au démarrage", true, autostart_enabled, None);
-        let quit_item = MenuItem::new("Quitter", true, None);
-
-        let menu = Menu::new();
-        let _ = menu.append(&toggle_item);
-        let _ = menu.append(&autostart_item);
-        let _ = menu.append(&PredefinedMenuItem::separator());
-        let _ = menu.append(&quit_item);
-
-        let tray = TrayIconBuilder::new()
-            .with_icon(rasterize_tray_icon())
-            .with_tooltip("HyperX Overlay")
-            .with_menu(Box::new(menu))
-            .build()
-            .expect("failed to create tray icon");
-
-        crate::debug_log::log(format!("tray icon rect: {:?}", tray.rect()));
-
-        Self {
-            _tray: tray,
-            toggle_item,
-            autostart_item,
-            quit_item,
-        }
+    pub fn build(autostart_enabled: bool) -> Self {
+        let (sender, actions) = mpsc::channel();
+        std::thread::spawn(move || run_tray(sender, autostart_enabled));
+        Self { actions }
     }
 
-    pub fn set_hidden_label(&self, hidden: bool) {
-        self.toggle_item.set_text(toggle_label(hidden));
-    }
-
-    pub fn set_autostart_checked(&self, checked: bool) {
-        self.autostart_item.set_checked(checked);
-    }
-
-    /// Drains every pending tray/menu event this frame and reports the last
-    /// meaningful action (there's realistically at most one per frame).
+    /// Drain the actions emitted by the tray's independent Win32 loop.
     pub fn poll(&self) -> Option<TrayAction> {
         let mut action = None;
-
-        while let Ok(event) = TrayIconEvent::receiver().try_recv() {
-            crate::debug_log::log(format!("tray event: {event:?}"));
-            if let TrayIconEvent::DoubleClick {
-                button: MouseButton::Left,
-                ..
-            } = event
-            {
-                action = Some(TrayAction::ToggleOverlay);
-            }
+        while let Ok(next) = self.actions.try_recv() {
+            action = Some(next);
         }
-
-        while let Ok(event) = MenuEvent::receiver().try_recv() {
-            crate::debug_log::log(format!("menu event: id={:?}", event.id));
-            if event.id == *self.toggle_item.id() {
-                action = Some(TrayAction::ToggleOverlay);
-            } else if event.id == *self.autostart_item.id() {
-                action = Some(TrayAction::ToggleAutostart);
-            } else if event.id == *self.quit_item.id() {
-                action = Some(TrayAction::Quit);
-            }
-        }
-
         action
     }
 }
 
-fn toggle_label(hidden: bool) -> &'static str {
-    if hidden {
-        "Afficher l'overlay"
-    } else {
-        "Masquer l'overlay"
-    }
-}
+fn run_tray(sender: mpsc::Sender<TrayAction>, autostart_enabled: bool) {
+    let toggle_item = MenuItem::new("Afficher / masquer l'overlay", true, None);
+    let autostart_item = CheckMenuItem::new("Lancer au démarrage", true, autostart_enabled, None);
+    let quit_item = MenuItem::new("Quitter", true, None);
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    let menu = Menu::new();
+    let _ = menu.append(&toggle_item);
+    let _ = menu.append(&autostart_item);
+    let _ = menu.append(&PredefinedMenuItem::separator());
+    let _ = menu.append(&quit_item);
 
-    #[test]
-    fn label_reflects_hidden_state() {
-        assert_eq!(toggle_label(true), "Afficher l'overlay");
-        assert_eq!(toggle_label(false), "Masquer l'overlay");
+    // Menu items themselves are thread-affine, but their IDs are safe to
+    // capture in tray-icon's global, Send + Sync event callback.
+    let toggle_id = toggle_item.id().clone();
+    let autostart_id = autostart_item.id().clone();
+    let quit_id = quit_item.id().clone();
+
+    let tray_sender = sender.clone();
+    TrayIconEvent::set_event_handler(Some(move |event| {
+        crate::debug_log::log(format!("tray event: {event:?}"));
+        if matches!(event, TrayIconEvent::DoubleClick { button: MouseButton::Left, .. }) {
+            let _ = tray_sender.send(TrayAction::ToggleOverlay);
+        }
+    }));
+
+    MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+        crate::debug_log::log(format!("menu event: id={:?}", event.id));
+        let action = if event.id == toggle_id {
+            Some(TrayAction::ToggleOverlay)
+        } else if event.id == autostart_id {
+            Some(TrayAction::ToggleAutostart)
+        } else if event.id == quit_id {
+            Some(TrayAction::Quit)
+        } else {
+            None
+        };
+        if let Some(action) = action {
+            let _ = sender.send(action);
+        }
+    }));
+
+    let tray = TrayIconBuilder::new()
+        .with_icon(rasterize_tray_icon())
+        .with_tooltip("HyperX Overlay")
+        .with_menu(Box::new(menu))
+        .build()
+        .expect("failed to create tray icon");
+    crate::debug_log::log(format!("tray icon rect: {:?}", tray.rect()));
+
+    // The icon owns a hidden Win32 window on this thread. Dispatch its
+    // messages here for the entire life of the application.
+    let mut message = MSG::default();
+    while unsafe { GetMessageW(&mut message, None, 0, 0) }.as_bool() {
+        unsafe {
+            let _ = TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
     }
+
+    drop(tray);
 }

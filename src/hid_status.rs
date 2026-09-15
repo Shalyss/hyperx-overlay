@@ -28,6 +28,9 @@ pub struct DeviceStatus {
     pub connected: bool,
     pub battery_pct: Option<u8>,
     pub charging: bool,
+    /// The wireless dongle is still enumerated, but the mouse did not answer
+    /// its status request (normally because it entered power-saving sleep).
+    pub sleeping: bool,
 }
 
 fn pad64(data: &[u8]) -> [u8; 64] {
@@ -107,6 +110,7 @@ fn parse_mouse_response(resp: &[u8]) -> Option<DeviceStatus> {
         connected: true,
         battery_pct: (pct <= 100).then_some(pct),
         charging: state == 0x01 || state == 0x02,
+        sleeping: false,
     })
 }
 
@@ -127,6 +131,7 @@ fn parse_headset_response(resp: &[u8]) -> Option<DeviceStatus> {
         connected: true,
         battery_pct: (pct <= 100).then_some(pct),
         charging: false,
+        sleeping: false,
     })
 }
 
@@ -152,6 +157,17 @@ pub fn poll_mouse(api: &HidApi) -> DeviceStatus {
         }
     }
     DeviceStatus::default()
+}
+
+/// The receiver is still connected to Windows, even if the mouse is asleep
+/// and therefore does not answer its vendor status report. This distinction
+/// lets the UI show "Veille" instead of pretending the mouse disappeared.
+pub fn mouse_status_collection_present(api: &HidApi) -> bool {
+    api.device_list().any(|info| {
+        let matches_id = info.vendor_id() == VID_HP && MOUSE_PIDS.contains(&info.product_id());
+        let matches_name = info.vendor_id() == VID_HP && product_matches(info, "saga pro");
+        (matches_id || matches_name) && info.usage_page() != LAMP_ARRAY_USAGE_PAGE
+    })
 }
 
 /// Cloud III S Wireless battery status: request `0c 02 03 01 00 06` on the

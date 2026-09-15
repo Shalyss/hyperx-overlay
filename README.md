@@ -15,8 +15,18 @@ Petit overlay Windows (toujours au premier plan, sans bordure) qui affiche :
   - Pulsefire Saga Pro : [notwaterbtl/hyperx-saga-control](https://github.com/notwaterbtl/hyperx-saga-control)
   - Cloud III S Wireless : [auto94/HyperX-Cloud-2-Battery-Monitor](https://github.com/auto94/HyperX-Cloud-2-Battery-Monitor)
 
-  Si un appareil n'est pas détecté ou ne répond pas, l'overlay affiche `--`
-  au lieu de planter.
+  Si un appareil n'est pas détecté, l'overlay affiche `--`.
+  Pour la souris, si le récepteur reste présent mais ne répond plus, l'overlay
+  affiche la dernière batterie connue avec `Veille` en gris. Cet état est une
+  estimation : une souris éteinte ou hors de portée peut produire le même résultat.
+
+- Lecture adaptative : souris en charge toutes les 10 s, active sur batterie
+  toutes les 15 s, en veille toutes les 60 s ; casque toutes les 30 s.
+  Les délais s'ajoutent au temps des requêtes et des éventuels réessais HID.
+  Le réveil est reconnu à la prochaine lecture réussie.
+- Batterie : vert en charge, blanc/gris clair autrement, orange à 30 % ou moins,
+  rouge à 15 % ou moins. La détection de charge du casque n'est pas disponible.
+- Le tray dispose d'un thread et d'une boucle de messages Win32 dédiés.
 
 - Fenêtre déplaçable : cliquer-glisser n'importe où dessus pour la repositionner.
 - `Alt + Clic` sur l'overlay : le masque (il reste accessible depuis le tray).
@@ -61,8 +71,8 @@ $env:HYPERX_OVERLAY_DEBUG = "1"
 .\hyperx-overlay.exe
 ```
 
-Laisser tourner ~1 minute (une interrogation a lieu au démarrage puis toutes
-les 30s), fermer avec `Échap`, puis envoyer le fichier généré :
+Laisser tourner quelques minutes (les intervalles dépendent de l'état de la
+souris), fermer avec `Échap`, puis envoyer le fichier généré :
 
 ```
 %TEMP%\hyperx-overlay-debug.log

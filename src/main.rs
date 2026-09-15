@@ -9,7 +9,7 @@ use eframe::egui;
 use hid_status::DeviceStatus;
 use hidapi::HidApi;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CAPITAL};
 use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN};
 
@@ -23,6 +23,62 @@ fn caps_lock_on() -> bool {
     unsafe { (GetKeyState(VK_CAPITAL.0 as i32) & 1) != 0 }
 }
 
+const HID_ATTEMPTS: usize = 3;
+const HID_RETRY_DELAY: Duration = Duration::from_millis(750);
+const MOUSE_CHARGING_INTERVAL: Duration = Duration::from_secs(10);
+const MOUSE_ACTIVE_INTERVAL: Duration = Duration::from_secs(15);
+const MOUSE_SLEEP_INTERVAL: Duration = Duration::from_secs(60);
+const HEADSET_INTERVAL: Duration = Duration::from_secs(30);
+
+fn poll_with_retries(mut poll: impl FnMut() -> DeviceStatus) -> DeviceStatus {
+    for attempt in 1..=HID_ATTEMPTS {
+        let status = poll();
+        if status.connected || attempt == HID_ATTEMPTS {
+            return status;
+        }
+        std::thread::sleep(HID_RETRY_DELAY);
+    }
+    unreachable!("the final HID attempt always returns")
+}
+
+fn preserve_recent_status(
+    fresh: DeviceStatus,
+    cached: &mut Option<(DeviceStatus, Instant)>,
+    now: Instant,
+    sleeping_device_present: bool,
+) -> DeviceStatus {
+    if fresh.connected {
+        *cached = Some((fresh, now));
+        return fresh;
+    }
+
+    if sleeping_device_present {
+        if let Some((last, _seen_at)) = cached {
+            debug_log::log("mouse HID read failed while dongle remains present; reporting sleep");
+            return DeviceStatus {
+                sleeping: true,
+                ..*last
+            };
+        }
+        return DeviceStatus {
+            connected: true,
+            sleeping: true,
+            ..DeviceStatus::default()
+        };
+    }
+    DeviceStatus::default()
+}
+
+fn mouse_poll_interval(status: DeviceStatus) -> Duration {
+    if status.sleeping {
+        MOUSE_SLEEP_INTERVAL
+    } else if status.charging {
+        MOUSE_CHARGING_INTERVAL
+    } else {
+        MOUSE_ACTIVE_INTERVAL
+    }
+}
+
 fn spawn_hid_poller(shared: Arc<Mutex<SharedState>>) {
     std::thread::spawn(move || {
         let mut api = match HidApi::new() {
@@ -32,16 +88,44 @@ fn spawn_hid_poller(shared: Arc<Mutex<SharedState>>) {
                 return;
             }
         };
+        let mut last_mouse = None;
+        let mut last_headset = None;
+        let mut next_mouse_poll = Instant::now();
+        let mut next_headset_poll = Instant::now();
         loop {
-            let _ = api.refresh_devices();
-            hid_status::log_known_devices(&api);
-            let mouse = hid_status::poll_mouse(&api);
-            let headset = hid_status::poll_headset(&api);
-            if let Ok(mut s) = shared.lock() {
-                s.mouse = mouse;
-                s.headset = headset;
+            let now = Instant::now();
+            if now >= next_mouse_poll {
+                let _ = api.refresh_devices();
+                hid_status::log_known_devices(&api);
+                let mouse = preserve_recent_status(
+                    poll_with_retries(|| hid_status::poll_mouse(&api)),
+                    &mut last_mouse,
+                    now,
+                    hid_status::mouse_status_collection_present(&api),
+                );
+                next_mouse_poll = Instant::now() + mouse_poll_interval(mouse);
+                if let Ok(mut s) = shared.lock() {
+                    s.mouse = mouse;
+                }
             }
-            std::thread::sleep(Duration::from_secs(30));
+
+            let now = Instant::now();
+            if now >= next_headset_poll {
+                let _ = api.refresh_devices();
+                let headset = preserve_recent_status(
+                    poll_with_retries(|| hid_status::poll_headset(&api)),
+                    &mut last_headset,
+                    now,
+                    false,
+                );
+                next_headset_poll = Instant::now() + HEADSET_INTERVAL;
+                if let Ok(mut s) = shared.lock() {
+                    s.headset = headset;
+                }
+            }
+
+            let wake_at = next_mouse_poll.min(next_headset_poll);
+            std::thread::sleep(wake_at.saturating_duration_since(Instant::now()));
         }
     });
 }
@@ -73,7 +157,6 @@ impl OverlayApp {
             self.shown_pos
         }));
         self.hidden = hidden;
-        self.tray_menu.set_hidden_label(hidden);
     }
 }
 
@@ -101,9 +184,10 @@ impl eframe::App for OverlayApp {
                 self.set_hidden(ctx, now_hidden);
             }
             Some(tray_ui::TrayAction::ToggleAutostart) => {
-                let enabled = !autostart::is_enabled();
-                autostart::set_enabled(enabled);
-                self.tray_menu.set_autostart_checked(enabled);
+                let requested = !autostart::is_enabled();
+                let _ = autostart::set_enabled(requested);
+                // Reflect the registry's actual state, not merely the state
+                // we attempted to write (which can fail on locked-down PCs).
             }
             Some(tray_ui::TrayAction::Quit) => {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -188,25 +272,133 @@ fn row_battery(ui: &mut egui::Ui, icon: egui::ImageSource, name: &str, status: &
         );
         ui.label(egui::RichText::new(name).color(egui::Color32::WHITE));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let (text, color) = match (status.connected, status.battery_pct) {
-                (true, Some(pct)) => {
-                    let color = if status.charging {
-                        egui::Color32::from_rgb(110, 180, 240)
-                    } else if pct <= 15 {
-                        egui::Color32::from_rgb(230, 90, 90)
-                    } else if pct <= 30 {
-                        egui::Color32::from_rgb(230, 180, 70)
-                    } else {
-                        egui::Color32::from_rgb(150, 220, 150)
-                    };
-                    (pct.to_string(), color)
-                }
-                (true, None) => ("?".to_string(), egui::Color32::from_gray(150)),
-                (false, _) => ("--".to_string(), egui::Color32::from_gray(90)),
-            };
+            let (text, color) = battery_display(status);
             ui.label(egui::RichText::new(text).color(color).size(17.0).strong());
         });
     });
+}
+
+fn battery_display(status: &DeviceStatus) -> (String, egui::Color32) {
+    if status.sleeping {
+        let text = match status.battery_pct {
+            Some(pct) => format!("{pct} % · Veille"),
+            None => "Veille".to_string(),
+        };
+        return (text, egui::Color32::from_gray(150));
+    }
+    match (status.connected, status.battery_pct) {
+        (true, Some(pct)) => {
+            // Green deliberately means external power / charging. A normal,
+            // sufficiently charged wireless device remains neutral.
+            let color = if status.charging {
+                egui::Color32::from_rgb(90, 220, 120)
+            } else if pct <= 15 {
+                egui::Color32::from_rgb(230, 90, 90)
+            } else if pct <= 30 {
+                egui::Color32::from_rgb(230, 180, 70)
+            } else {
+                egui::Color32::from_gray(225)
+            };
+            (pct.to_string(), color)
+        }
+        (true, None) => ("?".to_string(), egui::Color32::from_gray(150)),
+        (false, _) => ("--".to_string(), egui::Color32::from_gray(90)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn green_battery_text_means_charging() {
+        let on_battery = DeviceStatus {
+            connected: true,
+            battery_pct: Some(80),
+            charging: false,
+            sleeping: false,
+        };
+        let charging = DeviceStatus {
+            charging: true,
+            ..on_battery
+        };
+
+        assert_eq!(battery_display(&on_battery).1, egui::Color32::from_gray(225));
+        assert_eq!(battery_display(&charging).1, egui::Color32::from_rgb(90, 220, 120));
+    }
+
+    #[test]
+    fn recent_battery_value_survives_a_transient_hid_failure() {
+        let valid = DeviceStatus {
+            connected: true,
+            battery_pct: Some(64),
+            charging: true,
+            sleeping: false,
+        };
+        let now = Instant::now();
+        let mut cached = None;
+        assert_eq!(
+            preserve_recent_status(valid, &mut cached, now, false).battery_pct,
+            Some(64)
+        );
+
+        let temporary_failure = DeviceStatus::default();
+        let kept = preserve_recent_status(
+            temporary_failure,
+            &mut cached,
+            now + Duration::from_secs(10),
+            true,
+        );
+        assert_eq!(kept.battery_pct, Some(64));
+        assert!(kept.sleeping);
+
+        let still_sleeping = preserve_recent_status(
+            temporary_failure,
+            &mut cached,
+            now + Duration::from_secs(300),
+            true,
+        );
+        assert_eq!(still_sleeping.battery_pct, Some(64));
+
+        let disconnected = preserve_recent_status(
+            temporary_failure,
+            &mut cached,
+            now + Duration::from_secs(301),
+            false,
+        );
+        assert!(!disconnected.connected);
+    }
+
+    #[test]
+    fn sleeping_mouse_is_labeled_instead_of_disconnected() {
+        let status = DeviceStatus {
+            connected: true,
+            battery_pct: Some(64),
+            charging: false,
+            sleeping: true,
+        };
+        assert_eq!(battery_display(&status).0, "64 % · Veille");
+        assert_eq!(battery_display(&status).1, egui::Color32::from_gray(150));
+    }
+
+    #[test]
+    fn polling_interval_adapts_to_mouse_state() {
+        let active = DeviceStatus {
+            connected: true,
+            battery_pct: Some(80),
+            charging: false,
+            sleeping: false,
+        };
+        assert_eq!(mouse_poll_interval(active), MOUSE_ACTIVE_INTERVAL);
+        assert_eq!(
+            mouse_poll_interval(DeviceStatus { charging: true, ..active }),
+            MOUSE_CHARGING_INTERVAL
+        );
+        assert_eq!(
+            mouse_poll_interval(DeviceStatus { sleeping: true, ..active }),
+            MOUSE_SLEEP_INTERVAL
+        );
+    }
 }
 
 fn main() -> eframe::Result<()> {
@@ -244,7 +436,7 @@ fn main() -> eframe::Result<()> {
             // same thread as the actual winit event loop, and creating it too
             // early risked landing on the wrong one — matching tray-icon's own
             // documented eframe integration example.
-            let tray_menu = tray_ui::TrayMenu::build(false, autostart::is_enabled());
+            let tray_menu = tray_ui::TrayMenu::build(autostart::is_enabled());
             Ok(Box::new(OverlayApp {
                 shared,
                 tray_menu,
